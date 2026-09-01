@@ -1,7 +1,6 @@
-// steam_api64.retro: stand-in steam_api64.dll for the four legacy No Man's Sky builds
-// (1.09.1, 1.13, 1.24, 1.38 on Steam). Unwraps the SteamStub DRM in memory (see
+// steam_api64.retro: stand-in steam_api64.dll for the legacy No Man's Sky builds
+// (1.09.1 through 1.38 on Steam). Unwraps the SteamStub DRM in memory (see
 // steamstub.cpp) and answers the handful of Steamworks calls these builds make.
-// Any other executable is refused at load time.
 #include <windows.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -16,10 +15,7 @@
 bool steamstub_prepare(HMODULE exe);   // steamstub.cpp
 
 static const uint32_t APPID = 275850;
-
-static const struct { uint32_t timestamp; const char* version; } KNOWN_BUILDS[] = {   // PE header TimeDateStamp of NMS.exe
-    {0x57ff70ca, "1.09.1"}, {0x584983de, "1.13"}, {0x58d42a08, "1.24"}, {0x59ce2f3c, "1.38"},
-};
+static const uint32_t LAST_SUPPORTED_BUILD = 0x59ce2f3c;   // PE timestamp of the 1.38 (Atlas Rises) NMS.exe; anything newer is refused
 
 // ---- logging: create an empty steam_api64.retro.log next to the DLL to enable ----
 static char  g_dir[MAX_PATH];
@@ -30,18 +26,38 @@ void retro_log(const char* fmt, ...) {
     fputc('\n', g_log); fflush(g_log);
 }
 
-// ---- settings: same steam_settings\*.txt files the installer already writes for Goldberg ----
-static uint64_t    g_steamid = 76561197960287930ULL;   // Goldberg's default, keeps existing st_<id> save folders working
+// ---- identity: steam_api64.txt next to the DLL, written with defaults on first run ----
+// The Steam ID only has to be a number; the game uses it for the st_<id> save folder name.
+static uint64_t    g_steamid;
 static std::string g_name = "Player", g_lang = "english";
 static ULONGLONG   g_start;
-static std::map<std::string, bool> g_ach;              // ponytail: achievements live for the session only, add a file if anyone misses them
+static std::map<std::string, bool> g_ach;   // ponytail: achievements live for the session only, add a file if anyone misses them
 
-static std::string read_setting(const char* file, const char* def) {
-    char p[MAX_PATH]; snprintf(p, sizeof p, "%s\\steam_settings\\%s", g_dir, file);
-    FILE* f = fopen(p, "rb"); if (!f) return def;
-    char buf[256] = {0}; size_t n = fread(buf, 1, sizeof buf - 1, f); fclose(f);
-    while (n && (buf[n - 1] == '\r' || buf[n - 1] == '\n' || buf[n - 1] == ' ')) buf[--n] = 0;
-    return n ? std::string(buf) : def;
+static const struct { uint32_t timestamp; uint64_t steamid; } DEFAULT_IDS[] = {   // NMS.exe PE timestamp -> version number, so each build gets its own save folder
+    {0x57ff70ca, 109}, {0x584983de, 113}, {0x58d42a08, 124}, {0x59ce2f3c, 138},
+};
+
+static void load_settings(uint32_t exe_timestamp) {
+    for (auto& d : DEFAULT_IDS) if (d.timestamp == exe_timestamp) g_steamid = d.steamid;
+    char p[MAX_PATH]; snprintf(p, sizeof p, "%s\\steam_api64.txt", g_dir);
+    FILE* f = fopen(p, "r");
+    if (!f) {
+        if ((f = fopen(p, "w")) != 0) { fprintf(f, "steamid=%llu\nname=%s\nlanguage=%s\n", g_steamid, g_name.c_str(), g_lang.c_str()); fclose(f); }
+        return;
+    }
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        char* v = strchr(line, '=');
+        if (!v || line[0] == '#') continue;
+        *v++ = 0;
+        size_t n = strlen(v);
+        while (n && (v[n - 1] == '\n' || v[n - 1] == '\r' || v[n - 1] == ' ')) v[--n] = 0;
+        if (!n) continue;
+        if (!strcmp(line, "steamid")) g_steamid = strtoull(v, 0, 10);
+        else if (!strcmp(line, "name")) g_name = v;
+        else if (!strcmp(line, "language")) g_lang = v;
+    }
+    fclose(f);
 }
 
 // ---- callbacks ----
@@ -190,17 +206,13 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID) {
 
     HMODULE exe = GetModuleHandleA(0);
     IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)((uint8_t*)exe + ((IMAGE_DOS_HEADER*)exe)->e_lfanew);
-    const char* version = 0;
-    for (auto& k : KNOWN_BUILDS) if (k.timestamp == nt->FileHeader.TimeDateStamp) version = k.version;
-    if (!version) {
-        retro_log("unsupported exe, timestamp %08x", nt->FileHeader.TimeDateStamp);
-        MessageBoxA(0, "steam_api64.retro only works with the Steam builds of No Man's Sky 1.09.1, 1.13, 1.24 and 1.38.", "steam_api64.retro", MB_ICONERROR);
+    if (nt->FileHeader.TimeDateStamp > LAST_SUPPORTED_BUILD) {
+        retro_log("exe timestamp %08x is newer than 1.38, refusing", nt->FileHeader.TimeDateStamp);
+        MessageBoxA(0, "steam_api64.retro only works with No Man's Sky builds up to 1.38 (Atlas Rises).", "steam_api64.retro", MB_ICONERROR);
         TerminateProcess(GetCurrentProcess(), 1);
     }
-    g_steamid = strtoull(read_setting("force_steamid.txt", "76561197960287930").c_str(), 0, 10);
-    g_name = read_setting("force_account_name.txt", "Player");
-    g_lang = read_setting("force_language.txt", "english");
+    load_settings(nt->FileHeader.TimeDateStamp);
     bool wrapped = steamstub_prepare(exe);
-    retro_log("NMS %s, %s, steamid %llu name %s language %s", version, wrapped ? "SteamStub found" : "no SteamStub", g_steamid, g_name.c_str(), g_lang.c_str());
+    retro_log("exe timestamp %08x, %s, steamid %llu name %s language %s", nt->FileHeader.TimeDateStamp, wrapped ? "SteamStub found" : "no SteamStub", g_steamid, g_name.c_str(), g_lang.c_str());
     return TRUE;
 }
