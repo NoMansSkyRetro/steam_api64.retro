@@ -75,9 +75,6 @@ exist without them:
   version, is where the vtable slot numbers in `src/steam_api64.cpp` come from.
 - Valve's Steamworks SDK, which those headers originate from.
 
-Which slots each build actually calls was worked out from Ghidra
-decompilations of the four executables, which is why the emulation is small.
-
 ## License
 
 MIT, see LICENSE.
