@@ -34,6 +34,7 @@ enum { FLAG_NO_ENCRYPTION = 0x04 };
 static uint8_t*   g_base;
 static StubHeader g_hdr;
 static void*      g_oep;
+static void     (*g_after)();   // run once the code section is readable
 
 static void steam_xor(uint8_t* d, size_t n) {   // key = first dword, then each dword is XORed with the previous ciphertext dword
     uint32_t key; memcpy(&key, d, 4);
@@ -84,12 +85,15 @@ extern "C" int retro_entry(void* peb) {
         TerminateProcess(GetCurrentProcess(), 1);
     }
     retro_log("code section decrypted, continuing at original entry point %p", g_oep);
+    if (g_after) g_after();
     return ((int (*)(void*))g_oep)(peb);
 }
 
-// Called from DllMain, before the exe entry point runs. Returns false when the exe has no SteamStub.
-bool steamstub_prepare(HMODULE exe) {
+// Called from DllMain, before the exe entry point runs. Returns false when the exe has no SteamStub
+// (the caller then runs `after` itself, since the code is already readable).
+bool steamstub_prepare(HMODULE exe, void (*after)()) {
     g_base = (uint8_t*)exe;
+    g_after = after;
     IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(g_base + ((IMAGE_DOS_HEADER*)g_base)->e_lfanew);
     uint8_t* ep = g_base + nt->OptionalHeader.AddressOfEntryPoint;
     memcpy(&g_hdr, ep - sizeof g_hdr, sizeof g_hdr);

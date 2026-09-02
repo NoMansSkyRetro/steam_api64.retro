@@ -2,6 +2,7 @@
 // (1.09.1 through 1.38 on Steam). Unwraps the SteamStub DRM in memory (see
 // steamstub.cpp) and answers the handful of Steamworks calls these builds make.
 #include <windows.h>
+#include <winhttp.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -11,8 +12,9 @@
 #include <map>
 #include <vector>
 #include <utility>
+#pragma comment(lib, "winhttp.lib")
 
-bool steamstub_prepare(HMODULE exe);   // steamstub.cpp
+bool steamstub_prepare(HMODULE exe, void (*after)());   // steamstub.cpp
 
 static const uint32_t APPID = 275850;
 static const uint32_t LAST_SUPPORTED_BUILD = 0x59ce2f3c;   // PE timestamp of the 1.38 (Atlas Rises) NMS.exe; anything newer is refused
@@ -26,10 +28,12 @@ void retro_log(const char* fmt, ...) {
     fputc('\n', g_log); fflush(g_log);
 }
 
-// ---- identity: steam_api64.txt next to the DLL, written with defaults on first run ----
+// ---- settings: steam_api64.txt next to the DLL, written with defaults on first run ----
 // The Steam ID only has to be a number; the game uses it for the st_<id> save folder name.
 static uint64_t    g_steamid;
 static std::string g_name = "Player", g_lang = "english";
+static bool        g_modwarn;                                                  // disablemodwarning=
+static struct { bool on, https; wchar_t host[256]; INTERNET_PORT port; } g_srv;   // discoveriesserver=
 static ULONGLONG   g_start;
 static std::map<std::string, bool> g_ach;   // ponytail: achievements live for the session only, add a file if anyone misses them
 
@@ -37,15 +41,34 @@ static const struct { uint32_t timestamp; uint64_t steamid; } DEFAULT_IDS[] = { 
     {0x57ff70ca, 109}, {0x584983de, 113}, {0x58d42a08, 124}, {0x59ce2f3c, 138},
 };
 
+static void set_server(const char* v) {   // [http://|https://]host[:port]
+    g_srv.https = !_strnicmp(v, "https://", 8);
+    if (g_srv.https) v += 8; else if (!_strnicmp(v, "http://", 7)) v += 7;
+    char host[256]; strncpy(host, v, sizeof host - 1); host[sizeof host - 1] = 0;
+    char* end = strpbrk(host, "/ \t"); if (end) *end = 0;
+    g_srv.port = g_srv.https ? 443 : 80;
+    char* colon = strrchr(host, ':'); if (colon) { *colon = 0; g_srv.port = (INTERNET_PORT)atoi(colon + 1); }
+    if (!*host) return;
+    MultiByteToWideChar(CP_UTF8, 0, host, -1, g_srv.host, 256);
+    g_srv.on = true;
+}
+
 static void load_settings(uint32_t exe_timestamp) {
     for (auto& d : DEFAULT_IDS) if (d.timestamp == exe_timestamp) g_steamid = d.steamid;
     char p[MAX_PATH]; snprintf(p, sizeof p, "%s\\steam_api64.txt", g_dir);
     FILE* f = fopen(p, "r");
     if (!f) {
-        if ((f = fopen(p, "w")) != 0) { fprintf(f, "steamid=%llu\nname=%s\nlanguage=%s\n", g_steamid, g_name.c_str(), g_lang.c_str()); fclose(f); }
+        if ((f = fopen(p, "w")) != 0) {
+            fprintf(f, "# steam_api64.retro settings, see README.md\n"
+                       "steamid=%llu\nname=%s\nlanguage=%s\n"
+                       "# true skips the mods-enabled warning screen at boot (1.13 and later)\ndisablemodwarning=false\n"
+                       "# http://host:port or https://host sends the discoveries traffic to that server instead of Hello Games\ndiscoveriesserver=\n",
+                    g_steamid, g_name.c_str(), g_lang.c_str());
+            fclose(f);
+        }
         return;
     }
-    char line[256];
+    char line[512];
     while (fgets(line, sizeof line, f)) {
         char* v = strchr(line, '=');
         if (!v || line[0] == '#') continue;
@@ -56,8 +79,99 @@ static void load_settings(uint32_t exe_timestamp) {
         if (!strcmp(line, "steamid")) g_steamid = strtoull(v, 0, 10);
         else if (!strcmp(line, "name")) g_name = v;
         else if (!strcmp(line, "language")) g_lang = v;
+        else if (!strcmp(line, "disablemodwarning")) g_modwarn = !_stricmp(v, "true") || !strcmp(v, "1");
+        else if (!strcmp(line, "discoveriesserver")) set_server(v);
     }
     fclose(f);
+}
+
+// ---- mod warning: the pak loader sets a "mods loaded" byte after mounting PCBANKS/MODS, and the boot
+// screens show the warning only when it is set. Flip the stored value from 1 to 0. One hit in every
+// build that has the mod system (1.13+); 1.09.1 has none, so nothing to do there. ----
+static void patch_mod_warning() {
+    if (!g_modwarn) return;
+    static const uint8_t sig[] = {0x49, 0x8B, 0x06, 0xC6, 0x80, 0x92, 0x26, 0x00, 0x00, 0x01};   // mov rax,[r14]; mov byte [rax+0x2692],1
+    uint8_t* b = (uint8_t*)GetModuleHandleA(0);
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(b + ((IMAGE_DOS_HEADER*)b)->e_lfanew);
+    IMAGE_SECTION_HEADER* s = IMAGE_FIRST_SECTION(nt);
+    uint8_t* hit = 0; int hits = 0;
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++, s++) {
+        if (!(s->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        for (uint8_t* p = b + s->VirtualAddress, *e = p + s->Misc.VirtualSize - sizeof sig; p <= e; p++)
+            if (*p == sig[0] && !memcmp(p, sig, sizeof sig)) { hit = p; hits++; }
+    }
+    if (hits != 1) { retro_log("mod warning: signature found %d times, leaving the game alone", hits); return; }
+    DWORD old;
+    VirtualProtect(hit + 9, 1, PAGE_EXECUTE_READWRITE, &old);
+    hit[9] = 0;
+    VirtualProtect(hit + 9, 1, old, &old);
+    retro_log("mod warning disabled, patched byte at %p", hit + 9);
+}
+
+// ---- discoveries server: the game authenticates against <env>-nms-auth.nomanssky.com and takes every
+// other endpoint from the "routes" in that reply, so redirecting the auth connection is enough. Done by
+// hooking the exe's WinHTTP imports; scheme and port follow the configured URL. ----
+static HINTERNET (WINAPI *real_Connect)(HINTERNET, LPCWSTR, INTERNET_PORT, DWORD);
+static HINTERNET (WINAPI *real_OpenRequest)(HINTERNET, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR*, DWORD);
+static BOOL      (WINAPI *real_CloseHandle)(HINTERNET);
+static HINTERNET g_redirected[16];
+
+static bool hg_host(LPCWSTR h) {
+    size_t n = wcslen(h);
+    return (n >= 13 && !_wcsicmp(h + n - 13, L"nomanssky.com")) || wcsstr(h, L"hellogames") != 0;
+}
+static HINTERNET WINAPI my_Connect(HINTERNET session, LPCWSTR host, INTERNET_PORT port, DWORD reserved) {
+    if (!hg_host(host)) return real_Connect(session, host, port, reserved);
+    HINTERNET h = real_Connect(session, g_srv.host, g_srv.port, reserved);
+    retro_log("discoveries: %ls:%u -> %ls:%u%s", host, port, g_srv.host, g_srv.port, h ? "" : " (WinHttpConnect failed)");
+    for (auto& e : g_redirected) if (!e) { e = h; break; }
+    return h;
+}
+static HINTERNET WINAPI my_OpenRequest(HINTERNET conn, LPCWSTR verb, LPCWSTR path, LPCWSTR ver, LPCWSTR referrer, LPCWSTR* accept, DWORD flags) {
+    bool redirected = false;
+    for (auto e : g_redirected) if (e && e == conn) redirected = true;
+    if (!redirected) return real_OpenRequest(conn, verb, path, ver, referrer, accept, flags);
+    flags = g_srv.https ? (flags | WINHTTP_FLAG_SECURE) : (flags & ~WINHTTP_FLAG_SECURE);
+    HINTERNET h = real_OpenRequest(conn, verb, path, ver, referrer, accept, flags);
+    if (h && g_srv.https) {   // community servers rarely have a certificate the game would accept
+        DWORD f = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+        WinHttpSetOption(h, WINHTTP_OPTION_SECURITY_FLAGS, &f, sizeof f);
+    }
+    retro_log("discoveries: %ls %ls", verb, path);
+    return h;
+}
+static BOOL WINAPI my_CloseHandle(HINTERNET h) {
+    for (auto& e : g_redirected) if (e == h) e = 0;
+    return real_CloseHandle(h);
+}
+
+static void* hook_import(HMODULE mod, const char* dll, const char* fn, void* replacement) {
+    uint8_t* b = (uint8_t*)mod;
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(b + ((IMAGE_DOS_HEADER*)b)->e_lfanew);
+    IMAGE_DATA_DIRECTORY& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    for (IMAGE_IMPORT_DESCRIPTOR* d = (IMAGE_IMPORT_DESCRIPTOR*)(b + dir.VirtualAddress); dir.VirtualAddress && d->Name; d++) {
+        if (_stricmp((char*)(b + d->Name), dll)) continue;
+        IMAGE_THUNK_DATA* names = (IMAGE_THUNK_DATA*)(b + d->OriginalFirstThunk);
+        IMAGE_THUNK_DATA* iat = (IMAGE_THUNK_DATA*)(b + d->FirstThunk);
+        for (; names->u1.AddressOfData; names++, iat++) {
+            if (names->u1.Ordinal & IMAGE_ORDINAL_FLAG) continue;
+            if (strcmp(((IMAGE_IMPORT_BY_NAME*)(b + names->u1.AddressOfData))->Name, fn)) continue;
+            void* orig = (void*)iat->u1.Function;
+            DWORD old;
+            VirtualProtect(&iat->u1.Function, sizeof(void*), PAGE_READWRITE, &old);
+            iat->u1.Function = (ULONGLONG)replacement;
+            VirtualProtect(&iat->u1.Function, sizeof(void*), old, &old);
+            return orig;
+        }
+    }
+    return 0;
+}
+static void hook_winhttp(HMODULE exe) {
+    real_Connect     = (decltype(real_Connect))    hook_import(exe, "winhttp.dll", "WinHttpConnect",     (void*)&my_Connect);
+    real_OpenRequest = (decltype(real_OpenRequest))hook_import(exe, "winhttp.dll", "WinHttpOpenRequest", (void*)&my_OpenRequest);
+    real_CloseHandle = (decltype(real_CloseHandle))hook_import(exe, "winhttp.dll", "WinHttpCloseHandle", (void*)&my_CloseHandle);
+    retro_log("discoveries server %ls:%u (%s): WinHTTP hooks %s", g_srv.host, g_srv.port, g_srv.https ? "https" : "http",
+              real_Connect && real_OpenRequest && real_CloseHandle ? "installed" : "NOT installed, exe does not import WinHTTP by name");
 }
 
 // ---- callbacks ----
@@ -67,8 +181,9 @@ static std::vector<std::pair<int, std::vector<uint8_t>>> g_pending;
 static void post(int id, const void* data, size_t n) { g_pending.emplace_back(id, std::vector<uint8_t>((const uint8_t*)data, (const uint8_t*)data + n)); }
 
 #pragma pack(push, 8)
-struct UserStatsReceived_t     { uint64_t gameId; int result; uint64_t steamId; };                                  // 1101
-struct UserAchievementStored_t { uint64_t gameId; bool group; char name[128]; uint32_t cur, max; };                 // 1103
+struct UserStatsReceived_t          { uint64_t gameId; int result; uint64_t steamId; };                  // 1101
+struct UserAchievementStored_t      { uint64_t gameId; bool group; char name[128]; uint32_t cur, max; }; // 1103
+struct GetAuthSessionTicketResponse_t { uint32_t ticket; int result; };                                  // 163
 #pragma pack(pop)
 
 // ---- interfaces: a vtable of logging stubs per interface version, with the slots the game needs filled in ----
@@ -105,7 +220,6 @@ static uint32_t    real_time(void*)                              { return (uint3
 static const char* country(void*)                                { return "US"; }
 static uint64_t    voice_none(void*)                             { return 2; }   // k_EVoiceResultNotRecording
 static uint64_t    voice_nodata(void*)                           { return 3; }   // k_EVoiceResultNoData (anything but BufferTooSmall)
-static uint32_t    no_ticket(void*, void*, int, uint32_t* pcb)   { if (pcb) *pcb = 0; return 0; }
 static bool        stat_zero(void*, const char*, void* p)        { memset(p, 0, 4); return true; }
 static bool        get_ach(void*, const char* n, bool* pb)       { *pb = g_ach[n]; return true; }
 static bool        get_ach_time(void*, const char* n, bool* pb, uint32_t* t) { *pb = g_ach[n]; *t = 0; return true; }
@@ -117,6 +231,20 @@ static bool        set_ach(void*, const char* n) {
     return true;
 }
 static bool request_stats(void*) { UserStatsReceived_t r = {APPID, 1, g_steamid}; post(1101, &r, sizeof r); return true; }
+
+// The game hex-encodes this ticket into the "token" it POSTs to the auth server. Only handed out when a
+// discoveries server is configured; otherwise the game gets no ticket and stays quiet, as before.
+static uint32_t g_tickets;
+static uint32_t auth_ticket(void*, void* buf, int max, uint32_t* pcb) {
+    if (pcb) *pcb = 0;
+    if (!g_srv.on || max < 32) return 0;
+    struct { char magic[8]; uint64_t steamid, unixtime, zero; } t = {{'N','M','S','R','E','T','R','O'}, g_steamid, (uint64_t)time(0), 0};
+    memcpy(buf, &t, 32); *pcb = 32;
+    GetAuthSessionTicketResponse_t r = {++g_tickets, 1};
+    post(163, &r, sizeof r);
+    retro_log("auth ticket %u issued", r.ticket);
+    return r.ticket;
+}
 
 static void* find_iface(const char* version);
 static void* client_get (void*, int32_t, int32_t, const char* version) { return find_iface(version); }
@@ -136,7 +264,7 @@ static void* find_iface(const char* v) {
     } else if (!strncmp(v, "SteamUser0", 10)) {          // SteamUser019
         vt[0] = (void*)&ret1; vt[1] = (void*)&ret1; vt[2] = (void*)&my_id;
         vt[9] = (void*)&voice_none; vt[10] = (void*)&voice_none; vt[11] = (void*)&voice_nodata;
-        vt[13] = (void*)&no_ticket;
+        vt[13] = (void*)&auth_ticket;
     } else if (!strncmp(v, "SteamFriends", 12)) {        // SteamFriends015
         vt[0] = (void*)&my_name; vt[2] = (void*)&ret1;
         for (int s : {7, 9, 11, 14, 20, 21, 45, 47}) vt[s] = (void*)&ret_empty;
@@ -162,7 +290,7 @@ static void* find_iface(const char* v) {
     return OBJ(f);
 }
 
-// ---- exports: exactly what the four NMS.exe builds import ----
+// ---- exports: exactly what the NMS.exe builds import ----
 #define API extern "C" __declspec(dllexport)
 static int g_init;   // bumps on Init/Shutdown; SteamInternal_ContextInit re-runs the game's context init when it changes
 
@@ -212,7 +340,9 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID) {
         TerminateProcess(GetCurrentProcess(), 1);
     }
     load_settings(nt->FileHeader.TimeDateStamp);
-    bool wrapped = steamstub_prepare(exe);
+    if (g_srv.on) hook_winhttp(exe);   // the import table is not encrypted, so this can happen before the unwrap
+    bool wrapped = steamstub_prepare(exe, patch_mod_warning);
+    if (!wrapped) patch_mod_warning();
     retro_log("exe timestamp %08x, %s, steamid %llu name %s language %s", nt->FileHeader.TimeDateStamp, wrapped ? "SteamStub found" : "no SteamStub", g_steamid, g_name.c_str(), g_lang.c_str());
     return TRUE;
 }
