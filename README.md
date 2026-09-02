@@ -73,45 +73,15 @@ alone and says so in the log.
 These builds authenticate against `pc-nms-auth.nomanssky.com` with a Steam auth
 ticket and take every other endpoint from the `routes` in that reply, so
 redirecting the auth connection is enough to move the whole discoveries flow.
-With `discoveriesserver` set the DLL:
+With `discoveriesserver` set the DLL hooks the game's WinHTTP imports, sends any
+connection to a Hello Games host to your server instead (scheme and port from
+the setting, HTTPS without certificate checks), and hands the game an auth
+ticket it would otherwise not get without Steam.
 
-- hooks the game's `WinHttpConnect`, `WinHttpOpenRequest` and
-  `WinHttpCloseHandle` imports and sends any connection to a `nomanssky.com` or
-  `hellogames` host to your server instead, using the scheme and port from the
-  setting (plain HTTP works; HTTPS skips certificate validation);
-- hands the game an auth ticket, which it would otherwise not get without Steam.
-
-What your server receives first is `POST /Steam` (the path is the platform
-name) with headers `X-Hg-Key: a7427078-971b-4e85-911f-1c912a4f8832`,
-`X-Hg-CorrelationId: <guid>`, `User-Agent: Mozilla/5.0 (Skyscraper; Win|Final )`
-and a JSON body:
-
-```json
-{"token":"4E4D53524554524F...","version":"275850s3000","user":"Traveller","branch":"local","buildnum":0}
-```
-
-`token` is the hex of the 32-byte ticket the DLL issues: the ASCII magic
-`NMSRETRO`, the `steamid` as a little-endian 64-bit integer, the issue time as a
-little-endian 64-bit Unix timestamp, and 8 zero bytes. The game expects a JSON
-reply shaped like this (route URLs may use `http://`, an IP, and a port):
-
-```json
-{
-  "jwt": "opaque session token",
-  "ts": 1700000000,
-  "routes": {
-    "queryexact": "http://host:port/queryexact",
-    "querycategory": "...", "queryall": "...", "queryvoxel": "...", "querybase": "...",
-    "submitdiscovery": "...", "submitmessage": "...", "submitbase": "...",
-    "reportcontent": "...", "reportbase": "...", "blobserve": "..."
-  },
-  "settings": {"discoveryrefreshrate": 30, "messages": false}
-}
-```
-
-`ts` must be positive. A 403 from the auth call is treated by the game as a ban.
-The individual route payloads (`GcAtlasSendSubmitDiscoveryExact` and friends) are
-the game's own serialized structures and are not documented here.
+[DISCOVERIES-SERVER.md](DISCOVERIES-SERVER.md) documents the request and reply
+formats, the ticket layout, the route table per build, and what a real server
+would need. `tools\dummy_discoveries_server.py` is a logging dummy server to
+start from.
 
 ## Build
 
