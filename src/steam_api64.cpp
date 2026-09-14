@@ -29,8 +29,9 @@ void retro_log(const char* fmt, ...) {
 }
 
 // ---- settings: steam_api64.txt next to the DLL, written with defaults on first run ----
-// The Steam ID only has to be a number; the game uses it for the st_<id> save folder name.
-static uint64_t    g_steamid;
+// steamid is what the game is told its Steam ID is; savesteamid is the one the save system uses
+// instead (see patch_save_id). Both only have to be numbers.
+static uint64_t    g_steamid, g_saveid;
 static std::string g_name = "Player", g_lang = "english";
 static bool        g_modwarn;                                                  // disablemodwarning=
 static struct { bool on, https; wchar_t host[256]; INTERNET_PORT port; } g_srv;   // discoveriesserver=
@@ -61,11 +62,14 @@ static void load_settings(uint32_t exe_timestamp) {
         if ((f = fopen(p, "w")) != 0) {
             fprintf(f, "# steam_api64.retro settings, see README.md\n"
                        "steamid=%llu\nname=%s\nlanguage=%s\n"
+                       "# the save folder and the save encryption use this ID instead, so saves stay put when steamid changes\n"
+                       "savesteamid=%llu\n"
                        "# true skips the mods-enabled warning screen at boot (1.13 and later)\ndisablemodwarning=false\n"
                        "# http://host:port or https://host sends the discoveries traffic to that server instead of Hello Games\ndiscoveriesserver=\n",
-                    g_steamid, g_name.c_str(), g_lang.c_str());
+                    g_steamid, g_name.c_str(), g_lang.c_str(), g_steamid);
             fclose(f);
         }
+        g_saveid = g_steamid;
         return;
     }
     char line[512];
@@ -77,12 +81,14 @@ static void load_settings(uint32_t exe_timestamp) {
         while (n && (v[n - 1] == '\n' || v[n - 1] == '\r' || v[n - 1] == ' ')) v[--n] = 0;
         if (!n) continue;
         if (!strcmp(line, "steamid")) g_steamid = strtoull(v, 0, 10);
+        else if (!strcmp(line, "savesteamid")) g_saveid = strtoull(v, 0, 10);
         else if (!strcmp(line, "name")) g_name = v;
         else if (!strcmp(line, "language")) g_lang = v;
         else if (!strcmp(line, "disablemodwarning")) g_modwarn = !_stricmp(v, "true") || !strcmp(v, "1");
         else if (!strcmp(line, "discoveriesserver")) set_server(v);
     }
     fclose(f);
+    if (!g_saveid) g_saveid = g_steamid;   // no savesteamid line: saves stay where they always were
 }
 
 // ---- mod warning: the pak loader sets a "mods loaded" byte after mounting PCBANKS/MODS, and the boot
@@ -107,6 +113,57 @@ static void patch_mod_warning() {
     VirtualProtect(hit + 9, 1, old, &old);
     retro_log("mod warning disabled, patched byte at %p", hit + 9);
 }
+
+// ---- save Steam ID: the game asks SteamUser::GetSteamID once for its save manager and keeps the
+// answer, then uses it twice - to name the st_<id> save folder and as part of the key the save files
+// are encrypted with. That ties a save to whatever ID was live when it was written, so saves cannot
+// be carried between builds that run under different IDs. Every supported build reads that returned
+// ID with the same instruction right after the call (call [rax+0x10]; mov rax,[rsp+disp8]), followed
+// within a few bytes by the "an ID is present" byte going to +8 of the object being filled in, which
+// no other GetSteamID call site does. Replacing that one load with a call returning savesteamid puts
+// saves on their own ID and leaves every other use of the real one alone. One hit in 1.09.1 and 1.13
+// (save manager and cache share a constructor), two in 1.24 and 1.38 (it is inlined into both). ----
+static uint8_t* alloc_near(uint8_t* anchor) {   // the patch is a 5-byte call, so the trampoline has to be within 2GB
+    for (uint64_t off = 0x10000; off < 0x20000000; off += 0x10000)
+        for (int up = 0; up < 2; up++)
+            if (void* p = VirtualAlloc(anchor + (up ? (int64_t)off : -(int64_t)off), 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE))
+                return (uint8_t*)p;
+    return 0;
+}
+
+static void patch_save_id() {
+    if (g_saveid == g_steamid) return;
+    uint8_t* b = (uint8_t*)GetModuleHandleA(0);
+    uint8_t* tramp = alloc_near(b);
+    if (!tramp) { retro_log("save id: no free memory within reach of the exe, saves stay on steamid"); return; }
+    tramp[0] = 0x48; tramp[1] = 0xB8; memcpy(tramp + 2, &g_saveid, 8); tramp[10] = 0xC3;   // mov rax, savesteamid ; ret
+
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(b + ((IMAGE_DOS_HEADER*)b)->e_lfanew);
+    IMAGE_SECTION_HEADER* s = IMAGE_FIRST_SECTION(nt);
+    int hits = 0;
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++, s++) {
+        if (!(s->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        for (uint8_t* p = b + s->VirtualAddress, *e = p + s->Misc.VirtualSize - 24; p <= e; p++) {
+            if (p[0] != 0xFF || p[1] != 0x50 || p[2] != 0x10) continue;                     // call [rax+0x10] -> GetSteamID
+            if (p[3] != 0x48 || p[4] != 0x8B || p[5] != 0x44 || p[6] != 0x24) continue;     // mov rax,[rsp+disp8]
+            bool save = false;
+            for (int j = 8; j < 18 && !save; j++)                                           // mov byte [reg+8],1
+                save = p[j] == 0xC6 && (p[j + 1] & 0xF8) == 0x40 && (p[j + 1] & 7) != 4 && p[j + 2] == 0x08 && p[j + 3] == 0x01;
+            if (!save) continue;
+            int64_t rel = tramp - (p + 8);
+            if (rel != (int32_t)rel) continue;
+            DWORD old;
+            VirtualProtect(p + 3, 5, PAGE_EXECUTE_READWRITE, &old);
+            p[3] = 0xE8; memcpy(p + 4, &rel, 4);                                            // call tramp
+            VirtualProtect(p + 3, 5, old, &old);
+            hits++;
+        }
+    }
+    FlushInstructionCache(GetCurrentProcess(), 0, 0);
+    retro_log("save id %llu: patched %d call site(s)", g_saveid, hits);
+}
+
+static void patch_code() { patch_mod_warning(); patch_save_id(); }   // both run once the code section is readable
 
 // ---- discoveries server: the game authenticates against <env>-nms-auth.nomanssky.com and takes every
 // other endpoint from the "routes" in that reply, so redirecting the auth connection is enough. Done by
@@ -341,8 +398,8 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID) {
     }
     load_settings(nt->FileHeader.TimeDateStamp);
     if (g_srv.on) hook_winhttp(exe);   // the import table is not encrypted, so this can happen before the unwrap
-    bool wrapped = steamstub_prepare(exe, patch_mod_warning);
-    if (!wrapped) patch_mod_warning();
-    retro_log("exe timestamp %08x, %s, steamid %llu name %s language %s", nt->FileHeader.TimeDateStamp, wrapped ? "SteamStub found" : "no SteamStub", g_steamid, g_name.c_str(), g_lang.c_str());
+    bool wrapped = steamstub_prepare(exe, patch_code);
+    if (!wrapped) patch_code();
+    retro_log("exe timestamp %08x, %s, steamid %llu savesteamid %llu name %s language %s", nt->FileHeader.TimeDateStamp, wrapped ? "SteamStub found" : "no SteamStub", g_steamid, g_saveid, g_name.c_str(), g_lang.c_str());
     return TRUE;
 }

@@ -36,6 +36,7 @@ run the DLL writes `steam_api64.txt` next to itself; edit it as you like:
 
 ```
 steamid=138
+savesteamid=138
 name=Player
 language=english
 disablemodwarning=false
@@ -44,16 +45,32 @@ discoveriesserver=
 
 | Key | Meaning |
 |-----|---------|
-| `steamid` | Any number. The game only uses it to name the save folder, `%APPDATA%\HelloGames\NMS\st_<steamid>`. |
+| `steamid` | Any number. The Steam ID the game is told it is signed in as, and what it reports to the discoveries server. |
+| `savesteamid` | The ID the save system uses instead: it names the save folder `%APPDATA%\HelloGames\NMS\st_<savesteamid>` and forms part of the save encryption key. Defaults to `steamid`. |
 | `name` | Persona name reported by Steam. Also sent as `user` to the discoveries server. |
 | `language` | Game language reported by Steam. |
 | `disablemodwarning` | `true` skips the "mods enabled" screen shown at boot once `PCBANKS\DISABLEMODS.TXT` is removed. 1.13 and later; 1.09.1 has no mod system. |
 | `discoveriesserver` | `http://host:port` or `https://host[:port]`. Empty keeps the game pointed at Hello Games (whose 1.x servers are gone). |
 
-The default `steamid` is the version number for the four builds the installer
-ships (109, 113, 124, 138) so each build keeps its own saves, and 0 for any
-other build. To keep saves made with the old Goldberg setup, set `steamid` to
-the 17-digit ID that folder is named after.
+The default is the version number for the four builds the installer ships (109,
+113, 124, 138) so each build keeps its own saves, and 0 for any other build. The
+installer writes your real Steam ID as `steamid` and leaves `savesteamid` on the
+version number. Give two builds the same `savesteamid` to share one set of saves
+between them, and set it to the 17-digit ID a Goldberg-era folder is named after
+to keep those saves.
+
+### Save Steam ID
+
+The game asks Steam for its ID once, hands it to the save manager, and then uses
+it both to name the `st_<id>` folder and as part of the key the save files are
+encrypted with, so a save belongs to whichever ID was live when it was written.
+When `savesteamid` differs from `steamid` the DLL patches the one instruction
+that reads the returned ID - the `mov rax,[rsp+disp]` right after the
+`GetSteamID` call, told apart from the other call sites by the "ID present" flag
+stored just after it - to return `savesteamid` instead. Every other use of the ID
+still sees the real one. One call site in 1.09.1 and 1.13, where the save and
+cache managers share a constructor, and two in 1.24 and 1.38, where it is inlined
+into both.
 
 To get a log, create an empty `steam_api64.retro.log` next to the DLL. The log
 lists every interface the game asks for, the first call to any slot the DLL
